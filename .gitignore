@@ -5,3 +5,10 @@ __pycache__/
 # Windows
 Thumbs.db
 desktop.ini
+
+# 網頁版（WebAssembly）建置產物：由 build_web.py 自動生成，不需要進版本控制
+web_build/
+
+# 遊戲執行時產生的檔案
+crash_log.txt
+fire_debug.txt

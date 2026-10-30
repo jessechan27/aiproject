@@ -47,27 +47,82 @@ import os
 import sys
 import math
 import random
+import asyncio
 import pygame
 import pygame.gfxdraw
+
+# 瀏覽器（pygbag / WebAssembly）版與桌機版共用這一份原始碼：
+# 兩邊行為不同的地方一律用這個旗標切換，不必維護兩份程式。
+IS_WEB = sys.platform == "emscripten"
+HIGHSCORE_KEY = "alien3d_highscore"   # 瀏覽器版把最高分存進 localStorage 的鍵名
+
+if IS_WEB:
+    # 瀏覽器裡沒有終端機，遊戲載入素材時印的診斷訊息（[OK] / [MISS] / [FAIL]）
+    # 和例外的 traceback 全都會石沉大海。這裡把 stdout / stderr 轉到 JS console，
+    # 按 F12 就看得到，debug 網頁版時這是唯一的線索來源。
+    class _ConsoleOut:
+        def __init__(self, level):
+            self._level = level
+            self._buf = ""
+
+        def write(self, text):
+            self._buf += text
+            while "\n" in self._buf:
+                line, self._buf = self._buf.split("\n", 1)
+                try:
+                    import platform as _pf
+                    getattr(_pf.window.console, self._level)(line)
+                except Exception:
+                    pass
+            return len(text)
+
+        def flush(self):
+            if self._buf:
+                try:
+                    import platform as _pf
+                    getattr(_pf.window.console, self._level)(self._buf)
+                except Exception:
+                    pass
+                self._buf = ""
+
+    sys.stdout = _ConsoleOut("log")
+    sys.stderr = _ConsoleOut("error")
+    print("[BOOT] 模組載入完成，IS_WEB=True")
 
 # ---------------------------------------------------------------
 # 場景選擇："antarctic" = 南極冰原（需要 numpy）   "alien" = 原本的外星地貌
 # ---------------------------------------------------------------
 ENVIRONMENT = "antarctic"
-try:
-    import numpy
-except ImportError:
-    numpy = None
-    if ENVIRONMENT == "antarctic":
-        print("[提示] 南極冰原需要 numpy：pip install numpy  —— 暫時改用外星地貌")
-        ENVIRONMENT = "alien"
+numpy = None
+if IS_WEB:
+    # 瀏覽器版一定要完全避開 numpy。pygbag 0.9.3 的 numpy wasm wheel 會破壞 SDL 的
+    # 視訊初始化：只要那個 wheel 被載入，pygame.display.set_mode() 就會拋出
+    #     pygame.error: The video driver did not add any displays
+    # 遊戲連視窗都開不起來（已用 45 行的最小範例確認，與本遊戲的程式碼無關）。
+    #
+    # 注意：pygbag 是掃描原始碼來決定要預載哪些套件的，所以這個檔案裡不可以留下
+    # 匯入 numpy 的字面語句 —— 就算包在 try 裡、寫在函式內、或放在 if 的另一個
+    # 分支，一樣會被掃到並預載。桌機版因此改用 importlib 動態載入。
+    #
+    # 代價：網頁版沒有南極冰原地形，改用原本的外星地貌。遊戲其餘部分不受影響。
+    print("[提示] 網頁版不載入 numpy（pygbag 相容性問題）—— 改用外星地貌")
+    ENVIRONMENT = "alien"
+else:
+    try:
+        import importlib
+        numpy = importlib.import_module("numpy")
+    except ImportError:
+        if ENVIRONMENT == "antarctic":
+            print("[提示] 南極冰原需要 numpy：pip install numpy  —— 暫時改用外星地貌")
+            ENVIRONMENT = "alien"
 ICE = ENVIRONMENT == "antarctic"
 
 # ---------------------------------------------------------------
 # 基本設定
 # ---------------------------------------------------------------
 SCREEN_W, SCREEN_H = 1280, 720   # 16:9 寬螢幕：全螢幕時能佈滿一般螢幕，左右多看到更多場景
-FULLSCREEN = True                 # 啟動就全螢幕；F11 或 Alt+Enter 可切換全螢幕 / 視窗
+FULLSCREEN = not IS_WEB           # 桌機啟動就全螢幕；F11 或 Alt+Enter 可切換全螢幕 / 視窗
+                                  # 瀏覽器版從視窗模式開始：全螢幕一定要由使用者手勢觸發
 FPS = 60
 
 FOCAL = 520.0              # 焦距：越大視野越窄（望遠感）
@@ -160,6 +215,9 @@ def normalize(v):
 # ---------------------------------------------------------------
 # 素材載入
 # ---------------------------------------------------------------
+AUDIO_EXTS = (".ogg", ".mp3", ".wav")
+
+
 def find_asset(*candidates):
     try:
         files = os.listdir(ASSET_DIR)
@@ -170,7 +228,23 @@ def find_asset(*candidates):
         return s.lower().replace(" ", "").replace("_", "").replace("-", "")
 
     table = {norm(f): f for f in files}
+
+    # 音效檔的副檔名視為可互換：網頁版（pygbag / WASM）的 SDL_mixer 只解得開 OGG，
+    # 桌機版則用原本的 MP3。差異集中在這裡處理，就不必為了換音訊格式，
+    # 去改散落在程式各處的幾十組候選清單。網頁版優先找 .ogg。
+    expanded = []
     for cand in candidates:
+        stem, ext = os.path.splitext(cand)
+        if ext.lower() not in AUDIO_EXTS:
+            expanded.append(cand)
+            continue
+        if IS_WEB:
+            order = list(AUDIO_EXTS)
+        else:
+            order = [ext.lower()] + [e for e in AUDIO_EXTS if e != ext.lower()]
+        expanded.extend(stem + e for e in order)
+
+    for cand in expanded:
         hit = table.get(norm(cand))
         if hit:
             return os.path.join(ASSET_DIR, hit)
@@ -3395,6 +3469,7 @@ KAIJU_CORE = (0.0, 655.0, 185.0)                      # 虛空之眼在模型中
 
 def load_kaiju_frames():
     """把圖集切成 [階段][角度][姿勢] 的本體與自發光畫格；側轉角度再預先做好鏡像版。"""
+    global KAIJU_W, KAIJU_H, KAIJU_ANCHOR, KAIJU_PPU
     path = find_asset("megalon_sprites.png", "kuoyuan_sprites.png")      # 熔岩型（紅黑）優先
     if not path:
         print("  [MISS] kuoyuan_sprites.png -> 最終魔王改用母艦")
@@ -3404,6 +3479,20 @@ def load_kaiju_frames():
     except pygame.error as e:
         print(f"  [FAIL] kuoyuan_sprites.png: {e}")
         return None
+
+    # 圖集允許是縮小版：原尺寸 4400x3840 解開後是 64 MB 的點陣，WebAssembly 的
+    # 線性記憶體吃不下，所以網頁版會出半解析度的圖。這裡依實際圖集尺寸等比換算
+    # 格子大小、錨點與 PPU —— 魔王在畫面上的大小不會變，因為顯示寬度正比於
+    # KAIJU_W / KAIJU_PPU，兩者同時縮放剛好互相抵消。
+    # KAIJU_CORE 是模型的世界座標，跟圖集解析度無關，不要動它。
+    scale = atlas.get_width() / float(KAIJU_W * 10)
+    if abs(scale - 1.0) > 1e-6:
+        KAIJU_W = int(round(KAIJU_W * scale))
+        KAIJU_H = int(round(KAIJU_H * scale))
+        KAIJU_ANCHOR = tuple((ax * scale, ay * scale) for ax, ay in KAIJU_ANCHOR)
+        KAIJU_PPU *= scale
+        print(f"  [INFO] 魔王圖集為 {scale:.2f}x 解析度，格子尺寸已等比換算")
+
     W, H, cols, rows = KAIJU_W, KAIJU_H, 10, 4
     frames = {"base": {}, "glow": {}}
     for ph in (0, 1):
@@ -4446,8 +4535,19 @@ class Game:
 
     def __init__(self):
         pygame.init()
+
+        # 瀏覽器版一定要先把顯示視窗開起來，再初始化混音器。emscripten 的 SDL 如果
+        # 先初始化音訊子系統，視訊驅動就會回報「沒有任何顯示器」，接著
+        # set_mode() 直接拋出 pygame.error: The video driver did not add any displays。
+        # 桌機沒有這個限制，維持原本的順序（先備妥音訊，開窗後就能立刻播片頭音樂）。
+        self.screen = self.open_window(FULLSCREEN) if IS_WEB else None
+
         try:
-            pygame.mixer.pre_init(44100, -16, 2, 512)
+            # 緩衝區大小：桌機 512 樣本延遲低；瀏覽器下 512 太小會來不及填滿而斷音、
+            # 爆音，2048 才穩（代價是約 46ms 的延遲，射擊音效聽不太出來）。
+            # 取樣率必須和素材一致：build_web.py 會把網頁版的音訊統一成 44100 Hz，
+            # 否則 WASM 的即時重新取樣會讓音樂走音。
+            pygame.mixer.pre_init(44100, -16, 2, 2048 if IS_WEB else 512)
             pygame.mixer.init()
             pygame.mixer.set_num_channels(24)
             pygame.mixer.set_reserved(4)           # 0 號魔王叫聲、1、2 號腳步聲、3 號破關音樂：不會被爆炸音效擠掉
@@ -4459,7 +4559,8 @@ class Game:
             print(f"[WARN] 音效無法啟動：{e}")
             self.audio = False
 
-        self.screen = self.open_window(FULLSCREEN)
+        if self.screen is None:
+            self.screen = self.open_window(FULLSCREEN)
         self.disable_ime()
         self.ime_warn_t = -9999
         pygame.display.set_caption("Alien Adventure 3D")
@@ -4754,6 +4855,14 @@ class Game:
 
     # ---------- 紀錄 / 音樂 ----------
     def load_high_score(self):
+        if IS_WEB:
+            # 瀏覽器的虛擬檔案系統重新整理就清空，最高分要放 localStorage 才留得住
+            try:
+                import platform as _pf
+                raw = _pf.window.localStorage.getItem(HIGHSCORE_KEY)
+                return int(raw) if raw else 0
+            except Exception:
+                return 0
         try:
             with open(os.path.join(ASSET_DIR, "highscore3d.txt"), "r") as f:
                 return int(f.read().strip())
@@ -4761,6 +4870,13 @@ class Game:
             return 0
 
     def save_high_score(self):
+        if IS_WEB:
+            try:
+                import platform as _pf
+                _pf.window.localStorage.setItem(HIGHSCORE_KEY, str(self.high_score))
+            except Exception:
+                pass
+            return
         try:
             with open(os.path.join(ASSET_DIR, "highscore3d.txt"), "w") as f:
                 f.write(str(self.high_score))
@@ -5125,6 +5241,11 @@ class Game:
         16:9 螢幕會剛好佈滿；其他比例的螢幕會自動加上最少的黑邊，畫面不會被拉長變形。
         """
         self.fullscreen = fullscreen
+        if IS_WEB:
+            # 瀏覽器端畫面就是一塊固定大小的 canvas，SCALED 與 vsync 在 WASM 下不可靠，
+            # 所以開最單純的視窗，等比縮放交給網頁的 CSS 處理。
+            self.fullscreen = False
+            return pygame.display.set_mode((SCREEN_W, SCREEN_H))
         flags = pygame.SCALED | (pygame.FULLSCREEN if fullscreen else 0)
         for kw in ({"vsync": 1}, {}):                    # 先試垂直同步（畫面不撕裂），不支援就不用
             try:
@@ -7174,7 +7295,7 @@ class Game:
             self.terrain.set_quality(nq)
             print(f"[畫質] 平均每幀 {avg:.1f} ms，冰原地形自動調整為 {nq}")
 
-    def run(self):
+    async def run(self):
         running = True
         self._work = []
         if self.state == self.STATE_TITLE and self.audio and "intro" in self.music_files:
@@ -7219,18 +7340,23 @@ class Game:
             self.draw()
             self.auto_quality(pygame.time.get_ticks() - t_work)
 
+            # 把控制權交回瀏覽器，讓它有機會把這一幀畫出來、並收下鍵盤與滑鼠事件。
+            # 少了這一行，瀏覽器會整頁凍結。桌機上這行幾乎不花時間，兩邊共用同一個迴圈。
+            await asyncio.sleep(0)
+
         self.stop_music()
         pygame.quit()
-        sys.exit()
+        if not IS_WEB:
+            sys.exit()
 
 
-def run_with_crash_log():
+async def run_with_crash_log():
     """
     包一層錯誤攔截：Windows 上遊戲出錯時視窗會瞬間關閉，連錯誤訊息都看不到。
     這裡把完整錯誤與環境版本存到 crash_log.txt，並讓視窗停住，方便回報問題。
     """
     try:
-        Game().run()
+        await Game().run()
     except SystemExit:
         raise
     except Exception:
@@ -7250,11 +7376,13 @@ def run_with_crash_log():
         print("錯誤內容已存成 crash_log.txt，請把這個檔案的內容回報。")
         try:
             pygame.quit()
-            input("按 Enter 關閉視窗 ...")
+            if not IS_WEB:                 # 瀏覽器沒有終端機可以等使用者按 Enter
+                input("按 Enter 關閉視窗 ...")
         except Exception:
             pass
-        sys.exit(1)
+        if not IS_WEB:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
-    run_with_crash_log()
+    asyncio.run(run_with_crash_log())

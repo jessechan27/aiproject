@@ -60,6 +60,27 @@ git add -A && git commit -m "更新網頁版" && git push
 被載入，遊戲連視窗都開不起來。程式裡因此不能出現匯入 numpy 的字面語句 —— pygbag 是
 掃描原始碼決定預載哪些套件的，寫在 try 裡或函式內一樣會被掃到。
 
+## 踩過的雷（給未來的自己）
+
+移植到 WebAssembly 時踩到的坑，共同特徵是**靜默失敗** —— 沒有錯誤訊息、沒有 traceback，
+所以每一個都花了很久才找到。pygbag 0.9.3 實測：
+
+- **pygbag 預設不會把 Python 的 stdout/stderr 送到瀏覽器 console。**
+  所有錯誤都是靜默的，移植的第一件事就該先接上轉接器（寫到 `platform.window.console`）。
+  遊戲裡 `IS_WEB` 區塊的 `_ConsoleOut` 類別就是幹這個用的 —— 這招是整個除錯過程的轉捩點，
+  在它之前所有的問題都只能瞎猜。
+- **numpy 的 wasm wheel 會讓遊戲連視窗都開不起來**，而且 pygbag 是掃描原始碼決定預載
+  哪些套件的。詳見上一節。
+- **網頁版的 SDL_mixer 沒有 MP3 解碼器**，音訊全部要轉 OGG；取樣率還得統一成 44100，
+  因為素材原本 48000 和 44100 混雜，WASM 下的即時重新取樣會爆音、走音。
+  混音器緩衝區也要從 512 加大到 2048，否則聲音會斷斷續續。
+- **pygbag 用 Windows 的繁中預設編碼（cp950）讀 main.py**，中文註解會讓它
+  `UnicodeDecodeError`，然後 exit 0、什麼都不產生。所以 `build_web.py` 跑 pygbag 時
+  會設 `PYTHONUTF8=1`。
+- **`soundfile` 一次寫入整首長音樂會在 cffi 層堆疊溢位**，整個 Python 行程無聲無息結束
+  （exit 127，連 traceback 都沒有）。`build_web.py` 因此改用 `sf.SoundFile` 分塊寫入。
+  這種無訊息死亡可以用 `python -X faulthandler` 診斷。
+
 ## 開發紀錄
 
 `g1.py` ~ `g4.py`、`Claude3d*.py` 是開發過程的早期版本，保留當紀錄，不參與網頁版建置。
